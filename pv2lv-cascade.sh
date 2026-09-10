@@ -3,6 +3,17 @@ set -u
 export LC_ALL=C
 
 # ---------------------------------------------------------------------------
+# Rechte prüfen
+# ---------------------------------------------------------------------------
+
+if (( EUID != 0 )); then
+  echo "ERROR: Dieses Skript muss als root ausgeführt werden." >&2
+  echo "       Bitte verwenden: sudo $0" >&2
+  exit 1
+fi
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -61,18 +72,8 @@ printf '%-30s %7s %-9s %-8s %s\n' \
   LV SIZE TYPE RAID 'PVs(/dev/)'
 
 #
-# Graph inklusive der internen RAID-LVs.
-#
-# Beispiel:
-#
-# archive
-#   -> archive_rimage_0
-#      -> /dev/sda
-#   -> archive_rimage_1
-#      -> /dev/sdc
-#
-# Damit können die sichtbaren LVs auf die tatsächlichen PVs zurückgeführt
-# werden.
+# Segment-Graph inklusive interner RAID-LVs.
+# Wird nur zur Ermittlung der beteiligten PVs verwendet.
 #
 lvgraph=$(
   lvs -a --segments --noheadings --separator '|' \
@@ -142,14 +143,8 @@ pvs_for_lv() {
 }
 
 #
-# Wichtig:
-#
-# Hier KEIN segtype verwenden.
-#
-# segtype ist segmentbezogen und würde ein LV bei mehreren Segmenten
-# mehrfach ausgeben.
-#
-# lv_layout beschreibt dagegen das gesamte LV.
+# lv_layout statt segtype:
+# Dadurch erscheint jedes LV nur einmal, auch wenn es mehrere Segmente hat.
 #
 while IFS='|' read -r vg lv sz layout health cp; do
   vg=$(xargs <<<"$vg")
@@ -171,7 +166,7 @@ while IFS='|' read -r vg lv sz layout health cp; do
     *,mirror,*) type=mirror ;;
     *,linear,*) type=linear ;;
     *,striped,*) type=striped ;;
-    *) type=${layout//,/+} ;;
+    *)          type=${layout//,/+} ;;
   esac
 
   raid=-
@@ -206,7 +201,7 @@ done < <(
 
 printf '\nBTRFS FILESYSTEMS  (one row per FS UUID)\n'
 printf '%-18s %7s %-19s %s\n' \
-  FS SIZE PROFILE 'DEVICES(/dev/)'
+  FS SIZE PROFILE 'DEVICES(/dev/mapper/)'
 
 declare -A seenfs
 
@@ -259,16 +254,21 @@ while read -r uuid mnt; do
 
   show=$(btrfs filesystem show "$mnt" 2>/dev/null || :)
 
-  devs=$(
+  mapfile -t devs < <(
     sed -n 's/.* path \/dev\///p' <<<"$show" |
-      paste -sd, -
+      sed 's#^mapper/##'
   )
 
-  [[ -n $devs ]] || devs=-
+  if ((${#devs[@]} == 0)); then
+    devs=(-)
+  fi
 
   printf '%-18.18s %7s %-19.19s %s\n' \
-    "$label" "$sz" "$prof" "$devs" |
-    fold -w 80
+    "$label" "$sz" "$prof" "${devs[0]}"
+
+  for ((i=1; i<${#devs[@]}; i++)); do
+    printf '%47s%s\n' '' "${devs[i]}"
+  done
 
 done < <(
   findmnt -rn -t btrfs -o UUID,TARGET
