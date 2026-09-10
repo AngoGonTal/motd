@@ -50,285 +50,273 @@ done < <(
 # ---------------------------------------------------------------------------
 
 printf '\nLVM LOGICAL VOLUMES\n'
-printf '%-30s %7s %-9s %-8s %s\n' \
-  LV SIZE TYPE RAID 'PVs(/dev/)'
 
-#
-# Genau EIN LVM-Scan.
-#
-# Enthält:
-#   - sichtbare LVs
-#   - interne RAID-LVs
-#   - alle Segmente
-#   - deren Backing Devices
-#
+lvm_report=""
+lvm_rc=0
+
 lvm_report=$(
-  lvs -a --segments --noheadings --separator '|' \
-    -o vg_name,lv_name,lv_size,lv_layout,lv_health_status,copy_percent,devices \
-    2>/dev/null || :
-)
+  timeout --kill-after=0.2s 1s \
+    lvs -a --segments --noheadings --separator '|' \
+      -o vg_name,lv_name,lv_size,lv_layout,lv_health_status,copy_percent,devices \
+      2>/dev/null
+) || lvm_rc=$?
+
+if (( lvm_rc == 124 || lvm_rc == 137 )); then
+
+  printf '  TIMEOUT: LVM-Abfrage dauerte länger als 1 Sekunde.\n'
+
+elif (( lvm_rc != 0 )); then
+
+  printf '  ERROR: LVM-Abfrage fehlgeschlagen (Exit-Code %d).\n' "$lvm_rc"
+
+else
+
+  printf '%-30s %7s %-9s %-8s %s\n' \
+    LV SIZE TYPE RAID 'PVs(/dev/)'
+
+  # -------------------------------------------------------------------------
+  # PV-Spalten bestimmen
+  # -------------------------------------------------------------------------
+
+  mapfile -t pv_columns < <(
+    awk -F'|' '
+    function clean(x) {
+      gsub(/^[ \t]+|[ \t]+$/, "", x)
+      return x
+    }
+
+    {
+      n=split($7,a,",")
+
+      for (i=1; i<=n; i++) {
+        x=clean(a[i])
+
+        sub(/\([0-9]+\)$/, "", x)
+        gsub(/^\[/, "", x)
+        gsub(/\]$/, "", x)
+
+        if (x ~ /^\/dev\//) {
+          sub(/^\/dev\//, "", x)
+          print x
+        }
+      }
+    }
+    ' <<<"$lvm_report" |
+      sort -Vu
+  )
+
+  pv_width=4
+
+  for p in "${pv_columns[@]}"; do
+    if ((${#p} + 1 > pv_width)); then
+      pv_width=$((${#p} + 1))
+    fi
+  done
 
 
-# ---------------------------------------------------------------------------
-# PV-Spalten bestimmen
-# ---------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # PV-Matrix formatieren
+  # -------------------------------------------------------------------------
 
-mapfile -t pv_columns < <(
-  awk -F'|' '
-  function clean(x) {
-    gsub(/^[ \t]+|[ \t]+$/, "", x)
-    return x
+  format_pvs() {
+    local csv=$1
+    local p col out="" i j last=-1 comma cell
+
+    local -a selected=()
+    local -A member=()
+
+    [[ -n $csv && $csv != "-" ]] || {
+      printf '-'
+      return
+    }
+
+    IFS=',' read -ra selected <<<"$csv"
+
+    for p in "${selected[@]}"; do
+      member["$p"]=1
+    done
+
+    for ((i=0; i<${#pv_columns[@]}; i++)); do
+      if [[ ${member[${pv_columns[i]}]+x} ]]; then
+        last=$i
+      fi
+    done
+
+    ((last >= 0)) || {
+      printf '-'
+      return
+    }
+
+    for ((i=0; i<=last; i++)); do
+      col=${pv_columns[i]}
+      cell=""
+
+      if [[ ${member[$col]+x} ]]; then
+        comma=""
+
+        for ((j=i+1; j<=last; j++)); do
+          if [[ ${member[${pv_columns[j]}]+x} ]]; then
+            comma=","
+            break
+          fi
+        done
+
+        cell="${col}${comma}"
+      fi
+
+      printf -v cell "%-${pv_width}s" "$cell"
+      out+=$cell
+    done
+
+    printf '%s' "$out"
   }
 
-  {
-    n=split($7,a,",")
 
-    for (i=1; i<=n; i++) {
-      x=clean(a[i])
+  # -------------------------------------------------------------------------
+  # LVM-Graph einmal auswerten
+  # -------------------------------------------------------------------------
+
+  while IFS='|' read -r vg lv sz layout health cp pvs; do
+    [[ -n $lv ]] || continue
+
+    case ",$layout," in
+      *,raid0,*)  type=raid0 ;;
+      *,raid1,*)  type=raid1 ;;
+      *,raid4,*)  type=raid4 ;;
+      *,raid5,*)  type=raid5 ;;
+      *,raid6,*)  type=raid6 ;;
+      *,raid10,*) type=raid10 ;;
+      *,mirror,*) type=mirror ;;
+      *,linear,*) type=linear ;;
+      *,striped,*) type=striped ;;
+      *)          type=${layout//,/+} ;;
+    esac
+
+    raid=-
+
+    if [[ $layout == *raid* || $layout == *mirror* ]]; then
+      if [[ -n $health ]]; then
+        raid=$health
+      elif [[ -n $cp && $cp != 100* ]]; then
+        raid="sync${cp%%.*}%"
+      else
+        raid=ok
+      fi
+    fi
+
+    pv_display=$(format_pvs "${pvs:--}")
+
+    printf '%-30.30s %7s %-9s %-8s %s\n' \
+      "$vg/$lv" "$sz" "$type" "$raid" "$pv_display"
+
+  done < <(
+    awk -F'|' '
+
+    function clean(x) {
+      gsub(/^[ \t]+|[ \t]+$/, "", x)
+      return x
+    }
+
+    function depclean(x) {
+      x=clean(x)
 
       sub(/\([0-9]+\)$/, "", x)
       gsub(/^\[/, "", x)
       gsub(/\]$/, "", x)
 
-      if (x ~ /^\/dev\//) {
-        sub(/^\/dev\//, "", x)
-        print x
+      return x
+    }
+
+    function addpv(x) {
+      sub(/^\/dev\//, "", x)
+
+      if (pvseen[x] != generation) {
+        pvseen[x]=generation
+        pv[++npv]=x
       }
     }
-  }
-  ' <<<"$lvm_report" |
-    sort -Vu
-)
 
-#
-# Normalerweise 4 Zeichen:
-#
-# sda,
-# sdb,
-#
-# Bei längeren PV-Namen automatisch breiter.
-#
-pv_width=4
+    function walk(vg,lv, k,n,a,i,x) {
+      k=vg SUBSEP lv
 
-for p in "${pv_columns[@]}"; do
-  if ((${#p} + 1 > pv_width)); then
-    pv_width=$((${#p} + 1))
-  fi
-done
+      if (seen[k] == generation || !(k in deps))
+        return
 
+      seen[k]=generation
 
-# ---------------------------------------------------------------------------
-# PV-Matrix formatieren
-# ---------------------------------------------------------------------------
+      n=split(deps[k],a,",")
 
-format_pvs() {
-  local csv=$1
-  local p col out="" i j last=-1 comma cell
+      for (i=1; i<=n; i++) {
+        x=depclean(a[i])
 
-  local -a selected=()
-  local -A member=()
-
-  [[ -n $csv && $csv != "-" ]] || {
-    printf '-'
-    return
-  }
-
-  IFS=',' read -ra selected <<<"$csv"
-
-  for p in "${selected[@]}"; do
-    member["$p"]=1
-  done
-
-  for ((i=0; i<${#pv_columns[@]}; i++)); do
-    if [[ ${member[${pv_columns[i]}]+x} ]]; then
-      last=$i
-    fi
-  done
-
-  ((last >= 0)) || {
-    printf '-'
-    return
-  }
-
-  for ((i=0; i<=last; i++)); do
-    col=${pv_columns[i]}
-    cell=""
-
-    if [[ ${member[$col]+x} ]]; then
-      comma=""
-
-      for ((j=i+1; j<=last; j++)); do
-        if [[ ${member[${pv_columns[j]}]+x} ]]; then
-          comma=","
-          break
-        fi
-      done
-
-      cell="${col}${comma}"
-    fi
-
-    printf -v cell "%-${pv_width}s" "$cell"
-    out+=$cell
-  done
-
-  printf '%s' "$out"
-}
-
-
-# ---------------------------------------------------------------------------
-# LVM-Graph EINMAL auswerten
-# ---------------------------------------------------------------------------
-
-while IFS='|' read -r vg lv sz layout health cp pvs; do
-  [[ -n $lv ]] || continue
-
-  case ",$layout," in
-    *,raid0,*)  type=raid0 ;;
-    *,raid1,*)  type=raid1 ;;
-    *,raid4,*)  type=raid4 ;;
-    *,raid5,*)  type=raid5 ;;
-    *,raid6,*)  type=raid6 ;;
-    *,raid10,*) type=raid10 ;;
-    *,mirror,*) type=mirror ;;
-    *,linear,*) type=linear ;;
-    *,striped,*) type=striped ;;
-    *)          type=${layout//,/+} ;;
-  esac
-
-  raid=-
-
-  if [[ $layout == *raid* || $layout == *mirror* ]]; then
-    if [[ -n $health ]]; then
-      raid=$health
-    elif [[ -n $cp && $cp != 100* ]]; then
-      raid="sync${cp%%.*}%"
-    else
-      raid=ok
-    fi
-  fi
-
-  pv_display=$(format_pvs "${pvs:--}")
-
-  printf '%-30.30s %7s %-9s %-8s %s\n' \
-    "$vg/$lv" "$sz" "$type" "$raid" "$pv_display"
-
-done < <(
-  awk -F'|' '
-
-  function clean(x) {
-    gsub(/^[ \t]+|[ \t]+$/, "", x)
-    return x
-  }
-
-  function depclean(x) {
-    x=clean(x)
-
-    sub(/\([0-9]+\)$/, "", x)
-    gsub(/^\[/, "", x)
-    gsub(/\]$/, "", x)
-
-    return x
-  }
-
-  function addpv(x) {
-    sub(/^\/dev\//, "", x)
-
-    if (pvseen[x] != generation) {
-      pvseen[x]=generation
-      pv[++npv]=x
-    }
-  }
-
-  function walk(vg,lv, k,n,a,i,x) {
-    k=vg SUBSEP lv
-
-    if (seen[k] == generation || !(k in deps))
-      return
-
-    seen[k]=generation
-
-    n=split(deps[k],a,",")
-
-    for (i=1; i<=n; i++) {
-      x=depclean(a[i])
-
-      if (x ~ /^\/dev\//) {
-        addpv(x)
-      } else if ((vg SUBSEP x) in deps) {
-        walk(vg,x)
+        if (x ~ /^\/dev\//) {
+          addpv(x)
+        } else if ((vg SUBSEP x) in deps) {
+          walk(vg,x)
+        }
       }
     }
-  }
 
-  {
-    vg=clean($1)
+    {
+      vg=clean($1)
 
-    raw=clean($2)
-    lv=raw
+      raw=clean($2)
+      lv=raw
 
-    gsub(/^\[/, "", lv)
-    gsub(/\]$/, "", lv)
+      gsub(/^\[/, "", lv)
+      gsub(/\]$/, "", lv)
 
-    k=vg SUBSEP lv
+      k=vg SUBSEP lv
+      d=$7
 
-    #
-    # Alle Segmente desselben LV zusammenführen.
-    #
-    d=$7
+      if (deps[k] != "")
+        deps[k]=deps[k] "," d
+      else
+        deps[k]=d
 
-    if (deps[k] != "")
-      deps[k]=deps[k] "," d
-    else
-      deps[k]=d
+      if (raw !~ /^\[/) {
+        if (!(k in public)) {
+          public[k]=1
+          order[++count]=k
 
-    #
-    # Interne LVM-LVs stehen bei "lvs -a" in [].
-    # Nur öffentliche LVs später ausgeben.
-    #
-    if (raw !~ /^\[/) {
-      if (!(k in public)) {
-        public[k]=1
-        order[++count]=k
-
-        vgs[k]=vg
-        lvs[k]=lv
-        sizes[k]=clean($3)
-        layouts[k]=clean($4)
-        healths[k]=clean($5)
-        copies[k]=clean($6)
+          vgs[k]=vg
+          lvs[k]=lv
+          sizes[k]=clean($3)
+          layouts[k]=clean($4)
+          healths[k]=clean($5)
+          copies[k]=clean($6)
+        }
       }
     }
-  }
 
-  END {
-    for (z=1; z<=count; z++) {
-      k=order[z]
+    END {
+      for (z=1; z<=count; z++) {
+        k=order[z]
 
-      generation++
-      npv=0
+        generation++
+        npv=0
 
-      #
-      # Sichtbares LV rekursiv bis zu den echten PVs verfolgen.
-      #
-      walk(vgs[k],lvs[k])
+        walk(vgs[k],lvs[k])
 
-      list=""
+        list=""
 
-      for (i=1; i<=npv; i++)
-        list=list (i==1 ? "" : ",") pv[i]
+        for (i=1; i<=npv; i++)
+          list=list (i==1 ? "" : ",") pv[i]
 
-      print \
-        vgs[k] "|" \
-        lvs[k] "|" \
-        sizes[k] "|" \
-        layouts[k] "|" \
-        healths[k] "|" \
-        copies[k] "|" \
-        list
+        print \
+          vgs[k] "|" \
+          lvs[k] "|" \
+          sizes[k] "|" \
+          layouts[k] "|" \
+          healths[k] "|" \
+          copies[k] "|" \
+          list
+      }
     }
-  }
-  ' <<<"$lvm_report"
-)
+    ' <<<"$lvm_report"
+  )
+
+fi
 
 
 # ---------------------------------------------------------------------------
