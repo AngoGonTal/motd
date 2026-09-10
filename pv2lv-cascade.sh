@@ -14,29 +14,12 @@ fi
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-blk_cache() {
-  local p=$1 w
-
-  w=$(cat "/sys/class/block/$p/queue/write_cache" 2>/dev/null || :)
-
-  case "$w" in
-    *"write back"*)    echo WB ;;
-    *"write through"*) echo WT ;;
-    *)                 echo NA ;;
-  esac
-}
-
-
-# ---------------------------------------------------------------------------
 # Block devices
 # ---------------------------------------------------------------------------
 
-printf 'BLOCK DEVICES  (CACHE: WB=write-back, WT=write-through)\n'
-printf '%-20s %6s %-5s %-5s %s\n' \
-  DEVICE SIZE CACHE MEDIA SERIAL
+printf 'BLOCK DEVICES\n'
+printf '%-20s %6s %-5s %s\n' \
+  DEVICE SIZE MEDIA SERIAL
 
 while read -r d sz ty rot; do
   [[ $ty == disk || $ty == part ]] || continue
@@ -46,7 +29,6 @@ while read -r d sz ty rot; do
   p=${p##*/}
 
   s=$(lsblk -dn -o SERIAL "/dev/$p" 2>/dev/null | xargs)
-  c=$(blk_cache "$p")
 
   case $rot in
     0) m=FLASH ;;
@@ -54,8 +36,8 @@ while read -r d sz ty rot; do
     *) m='?' ;;
   esac
 
-  printf '%-20s %6s %-5s %-5s %s\n' \
-    "$d" "$sz" "$c" "$m" "${s:--}" |
+  printf '%-20s %6s %-5s %s\n' \
+    "$d" "$sz" "$m" "${s:--}" |
     fold -w 80
 
 done < <(
@@ -73,13 +55,20 @@ printf '%-30s %7s %-9s %-8s %s\n' \
 
 #
 # Segment-Graph inklusive interner RAID-LVs.
-# Wird nur zur Ermittlung der beteiligten PVs verwendet.
+# Dieser Report darf segmentbezogen sein, weil er nur intern verwendet wird.
 #
 lvgraph=$(
   lvs -a --segments --noheadings --separator '|' \
     -o vg_name,lv_name,devices 2>/dev/null || :
 )
 
+#
+# Rekursive Auflösung:
+#
+# sichtbares LV
+#   -> internes rimage/rmeta/etc.
+#   -> echtes /dev/sdX-PV
+#
 pvs_for_lv() {
   awk -F'|' -v V="$1" -v L="$2" '
 
@@ -143,8 +132,96 @@ pvs_for_lv() {
 }
 
 #
-# lv_layout statt segtype:
-# Dadurch erscheint jedes LV nur einmal, auch wenn es mehrere Segmente hat.
+# Alle real vorkommenden PVs ermitteln.
+#
+# Daraus entsteht eine feste horizontale Position:
+#
+# sda sdb sdc sdd sde ...
+#
+mapfile -t pv_columns < <(
+  awk -F'|' '
+  {
+    n=split($3,a,",")
+
+    for (i=1; i<=n; i++) {
+      x=a[i]
+
+      gsub(/^[ \t]+|[ \t]+$/, "", x)
+      sub(/\([0-9]+\)$/, "", x)
+      gsub(/^\[/, "", x)
+      gsub(/\]$/, "", x)
+
+      if (x ~ /^\/dev\//) {
+        sub(/^\/dev\//, "", x)
+        print x
+      }
+    }
+  }' <<<"$lvgraph" |
+    sort -Vu
+)
+
+#
+# PV-Liste in eine positionsfeste Matrix umwandeln.
+#
+# Beispiel:
+#
+# sda,sdb,    sdd,sde
+# sda,sdb,sdc,sdd,sde
+# sda,            sde
+# sda
+#         sdc
+#
+format_pvs() {
+  local csv=$1 p col out="" i j last=-1 comma
+  local -a selected=()
+  local -A member=()
+
+  [[ -n $csv && $csv != "-" ]] || {
+    printf '-'
+    return
+  }
+
+  IFS=',' read -ra selected <<<"$csv"
+
+  for p in "${selected[@]}"; do
+    member["$p"]=1
+  done
+
+  for ((i=0; i<${#pv_columns[@]}; i++)); do
+    if [[ ${member[${pv_columns[i]}]+x} ]]; then
+      last=$i
+    fi
+  done
+
+  (( last >= 0 )) || {
+    printf '-'
+    return
+  }
+
+  for ((i=0; i<=last; i++)); do
+    col=${pv_columns[i]}
+
+    if [[ ${member[$col]+x} ]]; then
+      comma=""
+
+      for ((j=i+1; j<=last; j++)); do
+        if [[ ${member[${pv_columns[j]}]+x} ]]; then
+          comma=","
+          break
+        fi
+      done
+
+      printf -v out '%s%-4s' "$out" "${col}${comma}"
+    else
+      printf -v out '%s%-4s' "$out" ""
+    fi
+  done
+
+  printf '%s' "$out"
+}
+
+#
+# lv_layout ist LV-bezogen und verhindert Mehrfachausgaben durch Segmente.
 #
 while IFS='|' read -r vg lv sz layout health cp; do
   vg=$(xargs <<<"$vg")
@@ -184,9 +261,10 @@ while IFS='|' read -r vg lv sz layout health cp; do
   pvs=$(pvs_for_lv "$vg" "$lv")
   [[ -n $pvs ]] || pvs=-
 
+  pv_display=$(format_pvs "$pvs")
+
   printf '%-30.30s %7s %-9s %-8s %s\n' \
-    "$vg/$lv" "$sz" "$type" "$raid" "$pvs" |
-    fold -w 80
+    "$vg/$lv" "$sz" "$type" "$raid" "$pv_display"
 
 done < <(
   lvs --noheadings --separator '|' \
@@ -199,7 +277,7 @@ done < <(
 # Btrfs
 # ---------------------------------------------------------------------------
 
-printf '\nBTRFS FILESYSTEMS  (one row per FS UUID)\n'
+printf '\nBTRFS FILESYSTEMS\n'
 printf '%-18s %7s %-19s %s\n' \
   FS SIZE PROFILE 'DEVICES(/dev/mapper/)'
 
